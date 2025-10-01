@@ -38,13 +38,7 @@ public class RemoveWcfAttributesGenerator : ISourceGenerator
 
             var root = declaration.SyntaxTree.GetRoot();
 
-            // Filtrowanie usingów - wyłączamy namespace powiązane z WCF
-            var usings = root.DescendantNodes()
-                             .OfType<UsingDirectiveSyntax>()
-                             .Where(u =>
-                                !u.Name.ToString().StartsWith("System.ServiceModel") &&
-                                !u.Name.ToString().StartsWith("System.Runtime.Serialization")
-                             );
+            string usingsText = GetUsingsWithDirectives(root);
 
             string namespaceName = symbol.ContainingNamespace?.ToDisplayString() ?? "";
             string originalTypeName = declaration.Identifier.Text;
@@ -53,14 +47,9 @@ public class RemoveWcfAttributesGenerator : ISourceGenerator
 
             var sourceBuilder = new StringBuilder();
 
-            // Dodajemy filtrowane usingi
-            foreach (var u in usings)
-            {
-                sourceBuilder.AppendLine(u.ToFullString());
-            }
+            sourceBuilder.AppendLine(usingsText);
             sourceBuilder.AppendLine();
 
-            // Namespace i klasa/interfejs
             sourceBuilder.AppendLine($"namespace {generatedNamespace}");
             sourceBuilder.AppendLine("{");
 
@@ -93,6 +82,53 @@ public class RemoveWcfAttributesGenerator : ISourceGenerator
 
             context.AddSource($"{generatedTypeName}.g.cs", SourceText.From(sourceBuilder.ToString(), Encoding.UTF8));
         }
+    }
+
+    private static string GetUsingsWithDirectives(SyntaxNode root)
+    {
+        var sourceText = new StringBuilder();
+
+        var directiveGroups = root.DescendantTrivia()
+            .Where(t => t.IsDirective)
+            .GroupBy(t => t.Token.Parent, (key, group) => new { Key = key, Trivia = group.ToList() });
+
+        foreach (var group in directiveGroups)
+        {
+            if (group.Key == null)
+                continue;
+
+            var usingNodes = group.Key.DescendantNodesAndSelf().OfType<UsingDirectiveSyntax>();
+            if (!usingNodes.Any())
+                continue;
+
+            if (usingNodes.Any(u =>
+            {
+                var ns = u.Name.ToString();
+                return ns.StartsWith("System.ServiceModel") || ns.StartsWith("CoreWCF");
+            }))
+            {
+                // Pomijamy cały blok z wykluczonymi usingami
+                continue;
+            }
+
+            sourceText.AppendLine(group.Key.ToFullString());
+        }
+
+        var rootUsings = root.DescendantNodes()
+            .OfType<UsingDirectiveSyntax>()
+            .Where(u => u.Parent is CompilationUnitSyntax)
+            .Where(u =>
+            {
+                var ns = u.Name.ToString();
+                return !ns.StartsWith("System.ServiceModel") && !ns.StartsWith("CoreWCF");
+            });
+
+        foreach (var u in rootUsings)
+        {
+            sourceText.AppendLine(u.ToFullString());
+        }
+
+        return sourceText.ToString();
     }
 
     private static string RemoveWcfAttributesFromText(string text)
