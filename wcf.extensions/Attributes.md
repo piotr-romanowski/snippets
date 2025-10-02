@@ -21,15 +21,30 @@ namespace System.ServiceModel.Web
         WrappedResponse
     }
 
-    // Atrybut WebInvoke - do operacji REST z niestandardowym http method
-    [AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
-    public sealed class WebInvokeAttribute : Attribute
-    {
-        public WebInvokeAttribute() : this("POST") { }
+    /using System;
 
-        public WebInvokeAttribute(string method)
+namespace System.ServiceModel.Web
+{
+    public enum WebMessageFormat
+    {
+        Xml,
+        Json
+    }
+
+    public enum WebMessageBodyStyle
+    {
+        Bare,
+        Wrapped,
+        WrappedRequest,
+        WrappedResponse
+    }
+
+    [AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
+    public class WebInvokeAttribute : Attribute
+    {
+        public WebInvokeAttribute()
         {
-            Method = method;
+            Method = "POST";
             UriTemplate = null;
             RequestFormat = WebMessageFormat.Xml;
             ResponseFormat = WebMessageFormat.Xml;
@@ -43,14 +58,26 @@ namespace System.ServiceModel.Web
         public WebMessageBodyStyle BodyStyle { get; set; }
     }
 
-    // Atrybut WebGet - do operacji REST GET z domyślnymi wartościami
     [AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
-    public sealed class WebGetAttribute : WebInvokeAttribute
+    public class WebGetAttribute : Attribute
     {
-        public WebGetAttribute() : base("GET")
+        public WebGetAttribute()
         {
+            Method = "GET";
+            UriTemplate = null;
+            RequestFormat = WebMessageFormat.Xml;
+            ResponseFormat = WebMessageFormat.Xml;
+            BodyStyle = WebMessageBodyStyle.Bare;
         }
+
+        public string Method { get; set; }
+        public string UriTemplate { get; set; }
+        public WebMessageFormat RequestFormat { get; set; }
+        public WebMessageFormat ResponseFormat { get; set; }
+        public WebMessageBodyStyle BodyStyle { get; set; }
     }
+}
+
 
     // Opcje formatowania URI w zapytaniu
     [Flags]
