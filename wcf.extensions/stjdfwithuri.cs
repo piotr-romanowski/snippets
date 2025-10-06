@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Specialized;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -23,47 +24,42 @@ public class SystemTextJsonDispatchFormatter : IDispatchMessageFormatter
         if (parameters == null)
             throw new ArgumentNullException(nameof(parameters));
 
-        // Pobierz dopasowanie URI z właściwości message
-        if (!message.Properties.TryGetValue(UriTemplateMatchResultsProperty.Name, out var matchObj) ||
+        if (!message.Properties.TryGetValue("UriTemplateMatchResults", out var matchObj) ||
             !(matchObj is UriTemplateMatch uriMatch))
         {
             throw new InvalidOperationException("Brak UriTemplateMatch w Message.Properties");
         }
 
-        var boundVariables = uriMatch.BoundVariables; // Nazwa -> string
+        NameValueCollection boundVariables = uriMatch.BoundVariables;
 
-        // Pobierz parametry opisane w kontrakcie z Request MessageParts
         var paramParts = _operationDescription.Messages[0].Body.Parts;
 
-        // Jeśli nie ma żadnych parametrów, zakończ (brak argumentów w metodzie)
         if (paramParts.Count == 0)
             return;
 
-        // W WCF REST: tylko maksymalnie jeden parametr z body (JSON)
-        // Znajdź czy istnieje parametr, który nie występuje w boundVariables (czyli z body)
+        // Znajdź parametr body - taki który nie jest w boundVariables
         int? bodyParamIndex = null;
         for (int i = 0; i < paramParts.Count; i++)
         {
-            if (!boundVariables.ContainsKey(paramParts[i].Name))
+            if (!boundVariables.AllKeys.Contains(paramParts[i].Name))
             {
                 bodyParamIndex = paramParts[i].Index;
                 break;
             }
         }
 
-        // Deserializuj parametry z URI do tablicy results
-        foreach (var kvp in boundVariables)
+        // Deserializuj parametry URI
+        foreach (string key in boundVariables.AllKeys)
         {
-            // Znajdź index parametru o tej nazwie
-            var param = paramParts.FirstOrDefault(p => p.Name == kvp.Key);
+            var param = paramParts.FirstOrDefault(p => p.Name == key);
             if (param != null)
             {
                 int idx = param.Index;
-                parameters[idx] = ConvertParameter(kvp.Value, param.Type);
+                parameters[idx] = ConvertParameter(boundVariables[key], param.Type);
             }
         }
 
-        // Deserializuj JSON z body gdy parametr body istnieje
+        // Deserializuj body JSON
         if (bodyParamIndex.HasValue)
         {
             var bodyPart = paramParts.First(p => p.Index == bodyParamIndex.Value);
@@ -124,7 +120,6 @@ public class SystemTextJsonDispatchFormatter : IDispatchMessageFormatter
         }
         catch
         {
-            // konwersja się nie powiodła, zwróć domyślną wartość
             return GetDefaultValue(targetType);
         }
     }
