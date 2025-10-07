@@ -1,13 +1,12 @@
 
-Poniżej przedstawiam kompletną, poprawioną wersję implementacji, korzystającą z `IMessageInspector` do wyznaczania, którą operację wywołano i odczytu wymagań z wcześniej zbudowanej mapy, przechowywanej w `ServiceBehavior`. W `ServiceAuthorizationManager` odczytujemy dane z `IncomingMessageProperties`, eliminując konieczność korzystania z `IExtension<OperationDescription>`, co nie jest właściwe.
+Poniżej znajduje się kompletna, poprawiona implementacja z wykorzystaniem **custom OperationSelector** zamiast `IDispatchMessageInspector` do rozpoznawania operacji w WCF webHttpBinding. Umożliwia to lekkie, szybkie i semantyczne przypisanie nazwy operacji do `IncomingMessageProperties`, co potem jest wykorzystywane w `ServiceAuthorizationManager` do autoryzacji.
 
 ***
 
-### 1. Definicja atrybutów i modelu wymagań
+### 1. Atrybuty i model wymagań
 
 ```csharp
 using System;
-using System.Linq;
 using System.Reflection;
 
 [AttributeUsage(AttributeTargets.Class | AttributeTargets.Method, AllowMultiple = false)]
@@ -44,7 +43,7 @@ public class OperationRequirement
 
 ***
 
-### 2. Budowanie mapy wymagań podczas konfiguracji serwisu
+### 2. `AuthorizationBehavior` – budowanie mapy wymagań
 
 ```csharp
 using System.Collections.Generic;
@@ -68,8 +67,19 @@ public class AuthorizationBehavior : IServiceBehavior
                 var methodInfo = contract.GetMethod(opDesc.Name);
                 var methodReq = GetRequirements(methodInfo) ?? defaultRequirement;
 
-                // Zapisywanie do mapy
                 OperationRequirements[opDesc.Name] = methodReq;
+            }
+
+            // Podmieniamy OperationSelector na własny
+            var dispatchRuntime = serviceHostBase.ChannelDispatchers
+                .OfType<ChannelDispatcher>()
+                .SelectMany(cd => cd.Endpoints)
+                .FirstOrDefault(ep => ep.Contract.Name == endpoint.Contract.Name)?
+                .DispatchRuntime;
+
+            if (dispatchRuntime != null)
+            {
+                dispatchRuntime.OperationSelector = new CustomOperationSelector(OperationRequirements);
             }
         }
     }
@@ -105,70 +115,50 @@ public class AuthorizationBehavior : IServiceBehavior
 
 ***
 
-### 3. Implementacja Inspektora wiadomości do ustalania operacji
+### 3. `CustomOperationSelector` - ustalanie operacji i wpis do IncomingMessageProperties
 
 ```csharp
-using System.ServiceModel;
+using System.Collections.Generic;
 using System.ServiceModel.Channels;
-using System.ServiceModel.Description;
 using System.ServiceModel.Dispatcher;
+using System.Linq;
+using System;
 
-public class OperationInspector : IDispatchMessageInspector
+public class CustomOperationSelector : IDispatchOperationSelector
 {
-    public object AfterReceiveRequest(ref Message request, IClientChannel channel, InstanceContext instanceContext)
+    private readonly Dictionary<string, OperationRequirement> _requirements;
+
+    public CustomOperationSelector(Dictionary<string, OperationRequirement> requirements)
     {
-        // Tu można wyłuskać nazwę operacji z URI lub nagłówków HTTP
-        // Zakładamy, że nazwę operacji można wywnioskować z URI (np. ostatni segment)
-
-        var httpProps = ObjectPropertyBag.GetProperty<HttpRequestMessageProperty>(request.Properties);
-        string path = null;
-        if (request.Properties.ContainsKey("HttpRequestMessageProperty"))
-            path = request.Properties["HttpRequestMessageProperty"] as HttpRequestMessageProperty?.Method;
-
-        // Jest różnie, ale dla prostoty:
-        string operationName = null;
-        if (request.Properties.TryGetValue("UriTemplateMatchResults", out var matchResultsObj))
-        {
-            var matchResults = matchResultsObj as System.Web.Http.Routing.HttpRouteData;
-            operationName = matchResults?.Values["operation"]?.ToString(); // jeśli masz to zdefiniowane w routing
-        }
-        else
-        {
-            // alternatywnie, odczyt z URI
-            var uri = request.Headers.To?.AbsolutePath;
-            if (uri != null)
-            {
-                var segments = new Uri(uri).Segments;
-                operationName = segments.LastOrDefault()?.Trim('/');
-            }
-        }
-
-        // W tym przykładzie zakładamy, że masz nazwę metody jako ostatni segment URI
-        if (!string.IsNullOrEmpty(operationName) && AuthorizationBehavior.OperationRequirements.ContainsKey(operationName))
-        {
-            // zapisanie do IncomingMessageProperties
-            request.Properties["OperationName"] = operationName;
-        }
-
-        return null;
+        _requirements = requirements;
     }
 
-    public void BeforeSendReply(ref Message reply, object correlationState)
+    public string SelectOperation(ref Message message)
     {
-        // Nic nie potrzebujemy
+        // Przykład: wyciągnięcie nazwy operacji z URI — zakładamy REST z segmentem metody na końcu
+        var uri = message.Properties.Via.AbsolutePath;
+        var segments = uri.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+
+        // Zakładamy, że ostatni segment to nazwa operacji
+        var operationName = segments.LastOrDefault();
+
+        if (!string.IsNullOrEmpty(operationName) && _requirements.ContainsKey(operationName))
+        {
+            // Przekazujemy operationName w IncomingMessageProperties do AuthorizationManager
+            message.Properties["OperationName"] = operationName;
+            return operationName;
+        }
+
+        // Fallback - domyślnie żadna operacja, wyrzuci błąd lub obsłuży inaczej
+        return null;
     }
 }
 ```
 
 
-### Uwaga:
-
-- W praktyce odczytałem `OperationName` z URI, co jest typowe dla REST API.
-- Dla konkretnych konfiguracji warto dopracować odczyt metody.
-
 ***
 
-### 4. `ServiceAuthorizationManager` wykonujący weryfikację
+### 4. `CustomServiceAuthorizationManager` – weryfikacja dostępu po odczycie operationName
 
 ```csharp
 using System.Collections.Generic;
@@ -197,7 +187,7 @@ public class CustomServiceAuthorizationManager : ServiceAuthorizationManager
 
         var claimSets = sc.AuthorizationContext.ClaimSets ?? new List<ClaimSet>();
 
-        // Sprawdzanie Claimów
+        // Sprawdzanie wymaganych claimów
         foreach (var claim in req.RequiredClaims)
         {
             if (!claimSets.Any(cs => cs.FindClaims(claim, Rights.PossessProperty).Any()))
@@ -218,19 +208,13 @@ public class CustomServiceAuthorizationManager : ServiceAuthorizationManager
 
 ***
 
-### 5. Ustawienia w hostingu
+### 5. Konfiguracja serwisu i dodanie behawioru
 
 ```csharp
 var host = new ServiceHost(typeof(MyService));
 host.Description.Behaviors.Add(new AuthorizationBehavior());
-// Dodajesz inspektor
-foreach (var dispatcher in host.ChannelDispatchers.OfType<ChannelDispatcher>())
-{
-    foreach (var endpoint in dispatcher.Endpoints)
-    {
-        endpoint.DispatchRuntime.MessageInspectors.Add(new OperationInspector());
-    }
-}
+
+// Otwórz host
 host.Open();
 ```
 
@@ -239,9 +223,11 @@ host.Open();
 
 ### Podsumowanie
 
-- Automatyczne ustalanie nazwy operacji na podstawie URI w `OperationInspector`.
-- Mapowanie wymagań na starcie i przechowywanie w statycznym słowniku w `AuthorizationBehavior`.
-- Autoryzacja oparta na odczycie tych wymagań w `CheckAccessCore`.
+- `AuthorizationBehavior` buduje mapę wymagań i podmienia `OperationSelector` na własny.
+- `CustomOperationSelector` rozpoznaje operację na podstawie URI i przekazuje jej nazwę do `IncomingMessageProperties`.
+- `CustomServiceAuthorizationManager` korzysta z tego, by sprawdzić wymagania i wykonać autoryzację.
 
-To rozwiązanie jest skalowalne i czyste, a użycie `IExtension<OperationDescription>` ogranicza się do konfiguracji, a runtime operacji odczytujemy z `IncomingMessageProperties`.
+To podejście jest lżejsze i bardziej zgodne z pipeline WCF niż inspektor wiadomości, co daje najlepszą wydajność i czytelność.
+
+Jeśli trzeba, mogę pomóc z dostosowaniem rozpoznawania operacji do specyficznego routingu URI.
 
