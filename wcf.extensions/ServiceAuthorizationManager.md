@@ -1,13 +1,13 @@
 
-Oto kompletna przykładowa implementacja z dodaniem własnego extension do operacji, by przechowywać nazwę metody i wymagania autoryzacyjne, oraz użyciem tego w ServiceAuthorizationManager.
+Poniżej przedstawiam kompletną, poprawioną wersję implementacji, korzystającą z `IMessageInspector` do wyznaczania, którą operację wywołano i odczytu wymagań z wcześniej zbudowanej mapy, przechowywanej w `ServiceBehavior`. W `ServiceAuthorizationManager` odczytujemy dane z `IncomingMessageProperties`, eliminując konieczność korzystania z `IExtension<OperationDescription>`, co nie jest właściwe.
 
 ***
 
-### Definicje atrybutów i klasy na wymagania
+### 1. Definicja atrybutów i modelu wymagań
 
 ```csharp
 using System;
-using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 
 [AttributeUsage(AttributeTargets.Class | AttributeTargets.Method, AllowMultiple = false)]
@@ -44,41 +44,17 @@ public class OperationRequirement
 
 ***
 
-### Własny Operation Extension do trzymania metadanych operacji
+### 2. Budowanie mapy wymagań podczas konfiguracji serwisu
 
 ```csharp
-using System.ServiceModel.Description;
-
-public class OperationMetadata : IExtension<OperationDescription>
-{
-    public string OperationName { get; }
-    public OperationRequirement Requirement { get; }
-
-    public OperationMetadata(string operationName, OperationRequirement requirement)
-    {
-        OperationName = operationName;
-        Requirement = requirement;
-    }
-
-    public void Attach(OperationDescription owner) { }
-    public void Detach(OperationDescription owner) { }
-}
-```
-
-
-***
-
-### ServiceBehavior do przypięcia metadanych do operacji
-
-```csharp
-using System.Collections.ObjectModel;
-using System.Linq;
+using System.Collections.Generic;
 using System.ServiceModel;
 using System.ServiceModel.Description;
-using System.ServiceModel.Dispatcher;
 
 public class AuthorizationBehavior : IServiceBehavior
 {
+    public static Dictionary<string, OperationRequirement> OperationRequirements { get; private set; } = new();
+
     public void ApplyDispatchBehavior(ServiceDescription serviceDescription, ServiceHostBase serviceHostBase)
     {
         var contractType = serviceDescription.ServiceType;
@@ -92,25 +68,23 @@ public class AuthorizationBehavior : IServiceBehavior
                 var methodInfo = contract.GetMethod(opDesc.Name);
                 var methodReq = GetRequirements(methodInfo) ?? defaultRequirement;
 
-                var metadata = new OperationMetadata(opDesc.Name, methodReq);
-                opDesc.Extensions.Add(metadata);
+                // Zapisywanie do mapy
+                OperationRequirements[opDesc.Name] = methodReq;
             }
         }
-
-        foreach (ChannelDispatcher cd in serviceHostBase.ChannelDispatchers)
-            foreach (var ed in cd.Endpoints)
-                ed.DispatchRuntime.ServiceAuthorizationManager = new CustomServiceAuthorizationManager();
     }
 
-    private OperationRequirement GetRequirements(MemberInfo member)
+    private static OperationRequirement GetRequirements(MemberInfo member)
     {
+        if (member == null) return null;
+
         var allowAnon = member.GetCustomAttribute<AllowAnonymousAttribute>() != null;
         var claimsAttr = member.GetCustomAttribute<RequiredClaimsAttribute>();
         var audAttr = member.GetCustomAttribute<RequiredAudiencesAttribute>();
 
         if (allowAnon || claimsAttr != null || audAttr != null)
         {
-            return new OperationRequirement()
+            return new OperationRequirement
             {
                 AllowAnonymous = allowAnon,
                 RequiredClaims = claimsAttr?.Claims ?? Array.Empty<string>(),
@@ -121,7 +95,8 @@ public class AuthorizationBehavior : IServiceBehavior
     }
 
     public void AddBindingParameters(ServiceDescription serviceDescription, ServiceHostBase serviceHostBase,
-        Collection<ServiceEndpoint> endpoints, BindingParameterCollection bindingParameters) { }
+        System.Collections.ObjectModel.Collection<ServiceEndpoint> endpoints, System.ServiceModel.Channels.BindingParameterCollection bindingParameters)
+    { }
 
     public void Validate(ServiceDescription serviceDescription, ServiceHostBase serviceHostBase) { }
 }
@@ -130,55 +105,111 @@ public class AuthorizationBehavior : IServiceBehavior
 
 ***
 
-### ServiceAuthorizationManager z odczytem rozszerzenia operacji
+### 3. Implementacja Inspektora wiadomości do ustalania operacji
+
+```csharp
+using System.ServiceModel;
+using System.ServiceModel.Channels;
+using System.ServiceModel.Description;
+using System.ServiceModel.Dispatcher;
+
+public class OperationInspector : IDispatchMessageInspector
+{
+    public object AfterReceiveRequest(ref Message request, IClientChannel channel, InstanceContext instanceContext)
+    {
+        // Tu można wyłuskać nazwę operacji z URI lub nagłówków HTTP
+        // Zakładamy, że nazwę operacji można wywnioskować z URI (np. ostatni segment)
+
+        var httpProps = ObjectPropertyBag.GetProperty<HttpRequestMessageProperty>(request.Properties);
+        string path = null;
+        if (request.Properties.ContainsKey("HttpRequestMessageProperty"))
+            path = request.Properties["HttpRequestMessageProperty"] as HttpRequestMessageProperty?.Method;
+
+        // Jest różnie, ale dla prostoty:
+        string operationName = null;
+        if (request.Properties.TryGetValue("UriTemplateMatchResults", out var matchResultsObj))
+        {
+            var matchResults = matchResultsObj as System.Web.Http.Routing.HttpRouteData;
+            operationName = matchResults?.Values["operation"]?.ToString(); // jeśli masz to zdefiniowane w routing
+        }
+        else
+        {
+            // alternatywnie, odczyt z URI
+            var uri = request.Headers.To?.AbsolutePath;
+            if (uri != null)
+            {
+                var segments = new Uri(uri).Segments;
+                operationName = segments.LastOrDefault()?.Trim('/');
+            }
+        }
+
+        // W tym przykładzie zakładamy, że masz nazwę metody jako ostatni segment URI
+        if (!string.IsNullOrEmpty(operationName) && AuthorizationBehavior.OperationRequirements.ContainsKey(operationName))
+        {
+            // zapisanie do IncomingMessageProperties
+            request.Properties["OperationName"] = operationName;
+        }
+
+        return null;
+    }
+
+    public void BeforeSendReply(ref Message reply, object correlationState)
+    {
+        // Nic nie potrzebujemy
+    }
+}
+```
+
+
+### Uwaga:
+
+- W praktyce odczytałem `OperationName` z URI, co jest typowe dla REST API.
+- Dla konkretnych konfiguracji warto dopracować odczyt metody.
+
+***
+
+### 4. `ServiceAuthorizationManager` wykonujący weryfikację
 
 ```csharp
 using System.Collections.Generic;
 using System.IdentityModel.Claims;
 using System.Linq;
 using System.ServiceModel;
-using System.ServiceModel.Channels;
-using System.ServiceModel.Dispatcher;
 
 public class CustomServiceAuthorizationManager : ServiceAuthorizationManager
 {
-    protected override bool CheckAccessCore(OperationContext operationContext)
+    protected override bool CheckAccessCore(OperationContext context)
     {
-        if (!operationContext.IncomingMessageProperties.TryGetValue("HttpOperation", out var opDescObj)
-            || !(opDescObj is OperationDescription opDesc))
+        var props = context.IncomingMessageProperties;
+        if (!props.TryGetValue("OperationName", out var opNameObj))
             return false;
 
-        var metadata = opDesc.Extensions.Find<OperationMetadata>();
-        if (metadata == null)
+        var operationName = opNameObj as string;
+        if (operationName == null || !AuthorizationBehavior.OperationRequirements.TryGetValue(operationName, out var req))
             return false;
 
-        var req = metadata.Requirement;
         if (req.AllowAnonymous)
             return true;
 
-        var sc = operationContext.ServiceSecurityContext;
+        var sc = context.ServiceSecurityContext;
         if (sc == null || !sc.PrimaryIdentity.IsAuthenticated)
             return false;
 
         var claimSets = sc.AuthorizationContext.ClaimSets ?? new List<ClaimSet>();
 
-        // Sprawdź wymagane claims
-        foreach (var requiredClaim in req.RequiredClaims)
+        // Sprawdzanie Claimów
+        foreach (var claim in req.RequiredClaims)
         {
-            bool found = claimSets.Any(cs => cs.FindClaims(requiredClaim, Rights.PossessProperty).Any());
-            if (!found)
+            if (!claimSets.Any(cs => cs.FindClaims(claim, Rights.PossessProperty).Any()))
                 return false;
         }
 
-        // Sprawdź wymagane audiences
-        foreach (var requiredAud in req.RequiredAudiences)
+        // Sprawdzanie audience
+        foreach (var aud in req.RequiredAudiences)
         {
-            bool foundAud = claimSets.Any(cs => cs.FindClaims("aud", Rights.PossessProperty)
-                .Any(c => c.Resource.ToString().Equals(requiredAud)));
-            if (!foundAud)
+            if (!claimSets.Any(cs => cs.FindClaims("aud", Rights.PossessProperty).Any(c => c.Resource.ToString() == aud)))
                 return false;
         }
-
         return true;
     }
 }
@@ -187,62 +218,30 @@ public class CustomServiceAuthorizationManager : ServiceAuthorizationManager
 
 ***
 
-### Uwaga dotycząca ustawienia `HttpOperation` w IncomingMessageProperties
-
-W przypadku webHttpBinding operacja, do której trafia request, może nie być standardowo dostępna pod kluczem `"HttpOperation"`. Możesz to zrobić ustanawiając własny `IDispatchMessageInspector` i ustawiając `IncomingMessageProperties["HttpOperation"]` podczas przyjmowania wiadomości. Przykładowo:
-
-```csharp
-public class OperationInspector : IDispatchMessageInspector
-{
-    public object AfterReceiveRequest(ref Message request, IClientChannel channel, InstanceContext instanceContext)
-    {
-        var endpointDispatcher = instanceContext.Host.ChannelDispatchers
-            .OfType<ChannelDispatcher>()
-            .SelectMany(cd => cd.Endpoints)
-            .FirstOrDefault(ep => ep.DispatchRuntime.AddressFilter.Match(request));
-
-        if (endpointDispatcher != null)
-        {
-            var operation = endpointDispatcher.DispatchRuntime.Operations
-                .FirstOrDefault(op => request.Headers.Action?.EndsWith(op.Name) == true);
-
-            if (operation != null)
-            {
-                request.Properties["HttpOperation"] = operation.Description;
-            }
-        }
-        return null;
-    }
-
-    public void BeforeSendReply(ref Message reply, object correlationState) { }
-}
-```
-
-Ten inspektor mocujesz do DispatchRuntime w `ApplyDispatchBehavior`.
-
-***
-
-### Podsumowanie dodania do serwisu
-
-W ServiceHost konfigurujesz:
+### 5. Ustawienia w hostingu
 
 ```csharp
 var host = new ServiceHost(typeof(MyService));
 host.Description.Behaviors.Add(new AuthorizationBehavior());
-foreach (ChannelDispatcher cd in host.ChannelDispatchers)
-    foreach (var ed in cd.Endpoints)
-        ed.DispatchRuntime.MessageInspectors.Add(new OperationInspector());
+// Dodajesz inspektor
+foreach (var dispatcher in host.ChannelDispatchers.OfType<ChannelDispatcher>())
+{
+    foreach (var endpoint in dispatcher.Endpoints)
+    {
+        endpoint.DispatchRuntime.MessageInspectors.Add(new OperationInspector());
+    }
+}
 host.Open();
 ```
 
 
 ***
 
-Ten wzorzec pozwala efektywnie:
+### Podsumowanie
 
-- Dopiąć metadane i wymagania do każdej operacji REST (webHttpBinding)
-- Rozpoznać operację w AuthorizationManager przez message inspector ustawiający extension
-- W `CheckAccessCore` mieć szybki dostęp do atrybutów i wymagań bez refleksji w runtime
+- Automatyczne ustalanie nazwy operacji na podstawie URI w `OperationInspector`.
+- Mapowanie wymagań na starcie i przechowywanie w statycznym słowniku w `AuthorizationBehavior`.
+- Autoryzacja oparta na odczycie tych wymagań w `CheckAccessCore`.
 
-Jeśli jest potrzeba, mogę pomóc też z dokładną implementacją inspektora lub innymi szczegółami.
+To rozwiązanie jest skalowalne i czyste, a użycie `IExtension<OperationDescription>` ogranicza się do konfiguracji, a runtime operacji odczytujemy z `IncomingMessageProperties`.
 
